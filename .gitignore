@@ -1,3 +1,4 @@
 .env
 settings.json
 income_tax_collection/
+__pycache__/
