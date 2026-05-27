@@ -1,14 +1,4 @@
 # %%
-%pip install -q langchain langchain-community langchain-core langchain-openai langgraph --upgrade
-%pip install -q python-dotenv nest_asyncio
-
-# %%
-import nest_asyncio
-
-nest_asyncio.apply()
-
-
-# %%
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph
 
@@ -23,7 +13,6 @@ class AgentState(TypedDict):
 
 
 graph_builder = StateGraph(AgentState)
-
 
 # %%
 from langchain_chroma import Chroma
@@ -55,11 +44,15 @@ client = Client()
 rag_prompt = client.pull_prompt("rlm/rag-prompt", dangerously_pull_public_prompt=True)
 
 llm = ChatOpenAI(model="gpt-4o")
+# 비용 절감을 위해 작은 llm model 선언
 small_llm = ChatOpenAI(model="gpt-4o-mini")
 
 # %%
 # 과세표준 구하는 과정
 
+# 여기서 나온 답변을 tax_base_equation_chain에 input으로 넣어
+# 여기서 나온 결과 : 과세표준 공식을 글로 써준다.
+# 이 결과가 tax_base_equation_chain의 tax_base_equation_information 로 들어간다
 tax_base_retrieval_chain = (
     {"context": retriever, "question": RunnablePassthrough()}
     | rag_prompt
@@ -77,6 +70,7 @@ tax_base_equation_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
+# tax_base_retrieval_chain의 결과가 들어온다.
 tax_base_equation_chain = (
     {"tax_base_equation_information": RunnablePassthrough()}
     | tax_base_equation_prompt
@@ -84,23 +78,23 @@ tax_base_equation_chain = (
     | StrOutputParser()
 )
 
+# final chain
 tax_base_chain = {
     "tax_base_equation_information": tax_base_retrieval_chain
 } | tax_base_equation_chain
 
 
-def get_tax_bsae_equation(state: AgentState):
+# 1. 과세표준 구하는 공식 그 자체를 구하는 노드
+def get_tax_base_equation(state: AgentState):
     tax_base_equation_question = "주택에 대한 종합부동산세 계산시 과세표준을 계산하는 방법을 수식으로 표현해서 알려주세요"
     tax_base_equation = tax_base_chain.invoke(tax_base_equation_question)
     return {"tax_base_equation": tax_base_equation}
 
-# %%
-# get_tax_bsae_equation({})
-# {'tax_base_equation': '과세표준 = max(0, (공시가격 합계 - 공제금액) × 공정시장가격비율)'}
 
 # %%
 # 공제액 구하는 과정
 
+# 공제액 구하는 chain
 tax_deduction_chain = (
     {"context": retriever, "question": RunnablePassthrough()}
     | rag_prompt
@@ -109,17 +103,12 @@ tax_deduction_chain = (
 )
 
 
+# 2. 과세표준의 공제 금액 구하는 노드 (retrieve)
 def get_tax_deduction(state: AgentState):
     tax_deduction_question = "주택에 대한 종합 부동산세 계산시 공제금액을 알려주세요"
     tax_deduction = tax_deduction_chain.invoke(tax_deduction_question)
     return {"tax_deduction": tax_deduction}
 
-# %%
-get_tax_deduction({})
-# {'tax_deduction': '주택에 대한 종합부동산세 계산 시 공제 금액은, 1세대 1주택자의 경우 공시가격에서 12억 원을 공제합니다. 1세대 1주택자가 아닌 다른 경우에는 9억 원을 공제합니다. 세부적인 공제 사항은 연령이나 소유 주택 수에 따라 다를 수 있습니다.'}
-
-# %%
-# %pip install -U langchain-tavily
 
 # %%
 # 공정시장가액비율 구하는 과정 -> 대통령령 -> 즉 web search가 필요하다.
@@ -135,6 +124,8 @@ tavily_search_tool = TavilySearch(
     include_images=True,
 )
 
+# system에 날짜 정보를 주지 않고, 아래 query에 날짜 정보를 넣는 것이 더 좋은 선택.
+# 검색 자체에 날짜가 포함되는게 더 정확도가 높기 때문이다.
 tax_market_ratio_prompt = ChatPromptTemplate.from_messages(
     [
         (
@@ -146,30 +137,29 @@ tax_market_ratio_prompt = ChatPromptTemplate.from_messages(
 )
 
 
+# 3. 공정시장가액비율 구하는 노드
 def get_market_ratio(state: AgentState):
     query = f"오늘 날짜:({date.today()})에 해당하는주택 공시가격 공정시장가액비율은 몇%인가요?"
     context = tavily_search_tool.invoke(query)
     print(f"context == {context}")
+    # define chain
     tax_market_ratio_chain = tax_market_ratio_prompt | llm | StrOutputParser()
+    # 결과(chain에 invoke)
     market_ratio = tax_market_ratio_chain.invoke({"context": context, "query": query})
     return {"market_ratio": market_ratio}
 
-# %%
-# get_market_ratio({})
-# {'market_ratio': '2026년 주택 공시가격의 공정시장가액비율은 공시가격에 따라 다릅니다:1주택자 재산세 \n- 공시가격 3억원 이하: 43%\n- 공시가격 3억원 초과 6억원 이하: 44%\n- 공시가격 6억원 초과: 45% \n\n, 종합부동산세 및 다주택자 재산세: \n 일괄적으로 60% 적용 \n\n이 비율은 재산세 과세표준을 산정할 때 적용됩니다.'}
 
 # %%
-from langchain_core.prompts import PromptTemplate
 
 tax_base_calculation_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
             """주어진 내용을 기반으로 과세표준을 계산해주세요.
-         과제표준 계산 공식: {tax_base_equation}
+         과세표준 계산 공식: {tax_base_equation}
          공제금액: {tax_deduction}
-         공정시장가액비율" {market_ratio}
-         사용자 주택 공시가격 정보" {query}
+         공정시장가액비율: {market_ratio}
+         사용자 주택 공시가격 정보: {query}
          """,
         ),
         ("human", "사용자 주택 공시가격 정보: {query}"),
@@ -177,12 +167,15 @@ tax_base_calculation_prompt = ChatPromptTemplate.from_messages(
 )
 
 
+# 1,2,3 노드를 합쳐서 과세표준 계산
 def calculate_tax_base(state: AgentState):
-    tax_base_equation = state["tax_base_equation"]
-    tax_deduction = state["tax_deduction"]
-    market_ratio = state["market_ratio"]
+    tax_base_equation = state["tax_base_equation"]  # 공식
+    tax_deduction = state["tax_deduction"]  # 공제 금액
+    market_ratio = state["market_ratio"]  # 공정시장가액비율
     query = state["query"]
+    # define chain
     tax_base_calculation_chain = tax_base_calculation_prompt | llm | StrOutputParser()
+    # 결과 (과세표준 계산 결과)
     tax_base = tax_base_calculation_chain.invoke(
         {
             "tax_base_equation": tax_base_equation,
@@ -194,18 +187,12 @@ def calculate_tax_base(state: AgentState):
     print(f"tax_base == {tax_base}")
     return {"tax_base": tax_base}
 
-# %%
-initial_state = {
-    "query": query,
-    "tax_base_equation": "과세표준 = max(0, (공시가격 합계 - 공제금액) × 공정시장가격비율)",
-    "tax_deduction": "주택에 대한 종합부동산세 계산 시 공제 금액은, 1세대 1주택자의 경우 공시가격에서 12억 원을 공제합니다. 1세대 1주택자가 아닌 다른 경우에는 9억 원을 공제합니다. 세부적인 공제 사항은 연령이나 소유 주택 수에 따라 다를 수 있습니다.",
-    "market_ratio": "2026년 주택 공시가격의 공정시장가액비율은 공시가격에 따라 다릅니다:1주택자 재산세 \n- 공시가격 3억원 이하: 43%\n- 공시가격 3억원 초과 6억원 이하: 44%\n- 공시가격 6억원 초과: 45% \n\n, 종합부동산세 및 다주택자 재산세: \n 일괄적으로 60% 적용 \n\n이 비율은 재산세 과세표준을 산정할 때 적용됩니다.",
-}
 
 # %%
-calculate_tax_base(initial_state)
+# 세율 계산
+# 사용자의 query & 과세표준을 가지고 세율을 구한다음에
+# 최종 계산을 해서 실제 세금으로 내야하는 금액 산출
 
-# %%
 tax_rate_calculation_prompt = ChatPromptTemplate.from_messages(
     [
         (
@@ -224,37 +211,31 @@ tax_rate_calculation_prompt = ChatPromptTemplate.from_messages(
 )
 
 
+# 세율 계산
 def calculate_tax_rate(state: AgentState):
     query = state["query"]
     tax_base = state["tax_base"]
     context = retriever.invoke(query)
+    # define chain
     tax_rate_chain = tax_rate_calculation_prompt | llm | StrOutputParser()
+    # 결과 반환(invoke)
     tax_rate = tax_rate_chain.invoke(
         {"context": context, "tax_base": tax_base, "query": query}
     )
     print(f"tax_rate == {tax_rate}")
     return {"answer": tax_rate}
 
-# %%
-calculate_tax_base(initial_state)
 
 # %%
-tax_base_state = {
-    "tax_base": "주어진 정보를 바탕으로 주택 공시가격의 합계, 공제금액, 공정시장가액비율을 통해 종합부동산세 과세표준을 계산해보겠습니다. \n\n1. **공시가격 합계**: 5억 + 10억 + 20억 = 35억 원\n\n2. **공제금액**:\n   - 사용자가 1세대 1주택자가 아닐 경우: 9억 원\n\n3. **과세표준 계산**:\n   - 과세표준 = max(0, (35억 - 9억) × 60%)\n   - 과세표준 = max(0, 26억 × 0.6)\n   - 과세표준 = max(0, 15.6억 원)\n\n따라서, 종합부동산세의 과세표준은 15.6억 원입니다. \n\n실제 세금액을 계산하기 위해서는 추가적인 정보가 필요합니다. 예를 들어, 과세표준에 따라 정해진 세율에 기반하여 정확한 세금액을 산출해야 합니다. 해당 세율은 법령에 의거하며, 연령 및 소유 주택 수에 따라 차이가 있을 수 있습니다. 정확한 세금액을 알고 싶다면, 국세청 또는 관련 세무 서비스에서 확인하시기를 권장드립니다.",
-    "query": query,
-}
-
-# %%
-calculate_tax_rate(tax_base_state)
-
-# %%
-graph_builder.add_node("get_tax_base_equation", get_tax_bsae_equation)
+# node
+graph_builder.add_node("get_tax_base_equation", get_tax_base_equation)
 graph_builder.add_node("get_tax_deduction", get_tax_deduction)
 graph_builder.add_node("get_market_ratio", get_market_ratio)
 graph_builder.add_node("calculate_tax_base", calculate_tax_base)
 graph_builder.add_node("calculate_tax_rate", calculate_tax_rate)
 
 # %%
+# edge
 from langgraph.graph import START, END
 
 graph_builder.add_edge(START, "get_tax_base_equation")
